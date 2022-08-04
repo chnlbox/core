@@ -1,0 +1,6 @@
+{
+    "require": {
+        "cosmonova-rnd/caspar-cg": "^2.0",
+        "stil/curl-easy": "^1.2"
+    }
+}
