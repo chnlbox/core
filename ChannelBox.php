@@ -13,58 +13,63 @@ class ChannelBox
     }
 }
 
-class MySQLDriver
+class SleekDBEngine
 {
     protected $db;
 
-    public function __construct ($db, $ip, $user, $pwd)
+    public function __construct ($dir)
     {
-        try
-        {
-            $this->db = new PDO("mysql:host={$ip};dbname={$db}", $user, $pwd);
-        }
-        catch (PDOException $e)
-        {
-            die ('[CORE] An error has occured. MySQL PDO Error: ' . $e->getMessage ());
-        }
+        $this->db = new \SleekDB\Store ("schedules", $dir);
     }
 
-    public function getSchedules ($channelId)
+    public function getNextSchedules ($channelId, $timeCorrection, &$resetMarker)
     {
-        $query = $this->db->prepare ('SELECT * FROM `schedule` WHERE startTime >= FLOOR(UNIX_TIMESTAMP(NOW(3))*1000) AND channel = :cId');
-        $query->bindValue (':cId', $channelId, PDO::PARAM_INT);
+        $query = $db->findBy ([
+            ["startTime", "=>", floor (microtime (true) * 1000)], "AND", ["channelId", "=", $channelId]
+        ], null, 2);
 
-        $query->execute ();
+        $evs = [];
+        $ev = null;
 
-        $events = [];
-
-        while ($row = $stmt->fetch(PDO::FETCH_LAZY))
+        foreach ($query as $aswr)
         {
-            $event = new SchedulerEvent;
+            $ev = new SchedulerEvent;
 
-            $event->time_start = $row['startTime'];
-            $event->ev_type = $row['type'];
-            $event->name = $row['name'];
+            if ($aswr->fixed_time == false)
+                $ev->time_start = $aswr->time_start + $timeCorrection;
+            else
+                $ev->time_start = $aswr->time_start;
 
-            switch ($row['type'])
+            $ev->name = $aswr->name;
+            $ev->ev_type = $aswr->ev_type;
+
+            switch ($aswr->ev_type)
             {
                 case 0:
-                    $event->ev_data = $row['data'];
+                case 2:
+                    $ev->ev_data = $aswr->ev_data;
                 break;
 
                 case 1:
-                    $event->ev_data = json_decode ($row['data']);
-                break;
-
-                case 2:
-                    $event->ev_data = $row['data'];
+                    $ev->ev_data = json_decode ($aswr->ev_data);
                 break;
             }
 
-            $events[] = $event;
+            $ev->take = $aswr->take;
+
+            if ($resetMarker == false)
+                $ev->restartEvent = $aswr->restartEvent;
+            else
+            {
+                $ev->restartEvent = false;
+                $resetMarker = false;
+            }
+
+            $evs[] = $ev;
+            
         }
 
-        return $events;
+        return $evs;
     }
 }
 
@@ -72,15 +77,15 @@ class Channels
 {
     protected $channels;
     public $ccgclient;
-    protected $mysql;
+    protected $db;
     protected $isCheckingSchedules = false;
 
-    public $mysqlUpdateTimeout = 30000;
+    public $updateTimeout = 1000;
     
-    public function __construct ($ip, $port, $mysql)
+    public function __construct ($ip, $port, $db)
     {
         $this->ccgclient = new \CosmonovaRnD\CasparCG\Client($ip, $port, 1);
-        $this->mysql = $mysql;
+        $this->db = $db;
     }
 
     public function addChannel ($channel, $useCustom = false)
@@ -122,9 +127,9 @@ class Channels
         return $this->channels[$id];
     }
 
-    public function updateMySQLSchedules ()
+    public function updateSchedules ()
     {
-        if ($this->mysql instanceof MySQLDriver)
+        if ($this->db instanceof SleekDBEngine)
         {
             if ($this->isCheckingSchedules == true)
             {
@@ -138,7 +143,7 @@ class Channels
             foreach ($channels as $channel)
             {
                 $pointer = key ($channels);
-                $this->channel ($pointer)->events = $this->mysql->getSchedules ($externalId);
+                $this->channel ($pointer)->events = $this->db->getSchedules ($externalId, $channel->timeCorrection, $channel->restartMarker);
             }
     
             $this->isCheckingSchedules = false;
@@ -149,8 +154,8 @@ class Channels
 
     public function poll ()
     {
-        if (floor (microtime (true) * 1000) % $this->mysqlUpdateTimeout == 0)
-            $this->updateMySQLSchedules ();
+        if (floor (microtime (true) * 1000) % $this->updateTimeout == 0)
+            $this->updateSchedules ();
 
         foreach ($this->channels as $sch)
             $sch->poll ();
@@ -166,14 +171,26 @@ class Channel
     public $disabled = false;
     public $ifRequest = false;
     public $request;
+    public $lastTime;
+    public $tempCorrection = 0;
+    public $restartMarker = false;
+
+    protected $logPath;
+    protected $currentCorrectionPath;
 
     public $ccgclient;
     public $externalId = 1;
 
-    public function __construct ($addCaspar = true, $ip = '127.0.0.1', $port = 5250)
+    public $timeCorrection = 0;
+    public $currentTaken = false;
+
+    public function __construct ($addCaspar = true, $ip = '127.0.0.1', $port = 5250, $logPath, $currentCorrectionPath)
     {
         if ($addCaspar == true)
             $this->ccgclient = new \CosmonovaRnD\CasparCG\Client($ip, $port, 1);
+
+        $this->logPath = $logPath;
+        $this->currentCorrectionPath = $currentCorrectionPath;
     }
 
     public function poll ()
@@ -184,35 +201,65 @@ class Channel
         if (empty ($this->events) and empty ($this->nextEvent))
             return;
 
-        if (($this->nextEvent instanceof SchedulerEvent) == false)
-            $this->nextEvent = array_shift ($this->events);
-
         if ($this->ifRequest == true)
             $this->request->socketPerform ();
+
+        if ($this->events[0]->restartEvent == true)
+        {
+            $this->timeCorrection = 0;
+            $this->events[0]->restartEvent = false;
+            $this->restartMarker = true;
+
+            echo "[{$this->name}] Datetime: $time ms. Event \"" . $this->events[0]->name . "\" caused a restart." . PHP_EOL;
+            file_put_contents ($this->logPath, "[" . date ('c') . "] [Channel \"" . $this->name . "\"] Event {$this->events[0]->name} at {$readableTime} caused a restart. Schedule correction: " . $this->timeCorrection, FILE_APPEND);
+        }
+
+        if ($this->events[0]->take == true)
+        {
+            $this->tempCorrection = floor (microtime (true) * 1000) - $this->lastTime;
+            echo "[{$this->name}] Datetime: $time ms. Event \"" . $this->events[0]->name . "\" holded already {$this->tempCorrection} ms." . PHP_EOL;
+
+            return;
+        }
+
+        if ($this->tempCorrection > 0)
+        {
+            $this->timeCorrection += $this->tempCorrection;
+            $this->tempCorrection = 0;
+        }
+
+        if (($this->nextEvent instanceof SchedulerEvent) == false)
+            $this->nextEvent = array_shift ($this->events);
             
         $time = floor (microtime (true) * 1000);
         $readableTime = date ('d.m.Y H:i:s');
 
-        #echo "[{$this->name}] Datetime: $readableTime. Wait " . date ('H:i:s', floor (($this->nextEvent->time_start - $time) / 1000)) . " to the next event \"" . $this->nextEvent->name . "\"." . PHP_EOL;
-        echo "[{$this->name}] Datetime: $time ms. Wait " . ($this->nextEvent->time_start - $time) . "ms to the next event \"" . $this->nextEvent->name . "\"." . PHP_EOL;
+        # echo "[{$this->name}] Datetime: $time ms. Wait " . ($this->nextEvent->time_start - $time) . "ms to the next event \"" . $this->nextEvent->name . "\"." . PHP_EOL;
 
         if ($time >= $this->nextEvent->time_start)
         {
+            $this->lastTime = floor (microtime (true) * 1000);
+
             $ev = $this->nextEvent;
             $this->nextEvent = array_shift ($this->events);
 
-            echo "[{$this->name}] Event executed." . PHP_EOL;
+            # echo "[{$this->name}] Event executed." . PHP_EOL;
 
             switch ($ev->ev_type)
             {
                 case 0:
-                    $this->ccgclient->send ($ev->ev_data);
-                break;
-
+                    $req = $this->ccgclient->send ($ev->ev_data);
+                    file_put_contents ($this->logPath, "[" . date ('c') . "] [Channel \"" . $this->name . "\"] Event {$ev->name} at {$readableTime} executed: {$req->getStatus()}. Schedule correction: " . $this->timeCorrection, FILE_APPEND);
                 case 1:
+                    $counter = -1;
+
                     foreach ($ev->ev_data as $cmd)
-                        $this->ccgclient->send ($cmd);
-                break;
+                    {
+                        $counter++;
+                        $req = $this->ccgclient->send ($cmd);
+                        file_put_contents ($this->logPath, "[" . date ('c') . "] [Channel \"" . $this->name . "\"] Multiple event [{$counter}] {$ev->name} at {$readableTime} executed: {$req->getStatus()}. Schedule correction: " . $this->timeCorrection, FILE_APPEND);
+                    }
+                    break;
 
                 case 2:
                     $this->request = new \cURL\Request ($ev->ev_data);
@@ -228,6 +275,9 @@ class Channel
                     });
 
                     $this->request->socketPerform ();
+
+                    file_put_contents ($this->logPath, "[" . date ('c') . "] [Channel \"" . $this->name . "\"] Event {$ev->name} at {$readableTime} executed (HTTP requests without status). Schedule correction: " . $this->timeCorrection, FILE_APPEND);
+
                 break;
             }
         }
@@ -240,4 +290,6 @@ class SchedulerEvent
     public $ev_type = 0; // Event type: 0 - CasparCG AMCP Command; 1 - CasparCG Multi-AMCP Commands; 2 - HTTP GET;
     public $ev_data;
     public $name;
+    public $take = false; // False - Go to next event; True - If the event ends then take time.
+    public $restartEvent = false; // If $restartEvent is true, ChannelBox will be reset a correction time for schedules;
 }
