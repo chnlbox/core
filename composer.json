@@ -2,6 +2,6 @@
     "require": {
         "cosmonova-rnd/caspar-cg": "^2.0",
         "stil/curl-easy": "^1.2",
-        "rakibtg/sleekdb": "^2.13"
+        "fireworkweb/smpte": "^1.3"
     }
 }
